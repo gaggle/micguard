@@ -1,5 +1,5 @@
 // micguard: keeps the default input on the Mac's built-in microphone, or on
-// a preferred input device chosen at install time.
+// the highest-priority connected device from a preferred list.
 // Output devices are left alone, so AirPods still play audio.
 import CoreAudio
 import Foundation
@@ -69,17 +69,28 @@ func device(named wanted: String) -> AudioDeviceID? {
   inputDevices().first { name($0) == wanted }
 }
 
-// The preferred device if one was chosen, otherwise the built-in mic.
-// nil when it isn't connected, in which case the input is left alone.
-func target(_ preferred: String?) -> AudioDeviceID? {
-  preferred.map(device(named:)) ?? builtInMic()
+// List entry that means the built-in mic, whatever it is called on this Mac.
+let builtInEntry = "built-in"
+
+func resolve(_ entry: String) -> AudioDeviceID? {
+  entry == builtInEntry ? builtInMic() : device(named: entry)
+}
+
+// The first connected device in the priority list, or the built-in mic when
+// no list is set. nil when none is connected, in which case the input is left alone.
+func target(_ preferred: [String]) -> AudioDeviceID? {
+  preferred.isEmpty ? builtInMic() : preferred.lazy.compactMap(resolve).first
+}
+
+func describe(_ preferred: [String]) -> String {
+  preferred.isEmpty ? "built-in mic" : preferred.joined(separator: " > ")
 }
 
 func defaultInput() -> AudioDeviceID? {
   readUInt32(system, address(kAudioHardwarePropertyDefaultInputDevice))
 }
 
-func enforce(_ preferred: String?) {
+func enforce(_ preferred: [String]) {
   guard var mic = target(preferred), defaultInput() != mic else { return }
   let previous = defaultInput().map(name) ?? "none"
   var a = address(kAudioHardwarePropertyDefaultInputDevice)
@@ -88,13 +99,13 @@ func enforce(_ preferred: String?) {
   log(status == noErr ? "input \(previous) -> \(name(mic))" : "set input failed: \(status)")
 }
 
-func run(_ preferred: String?) -> Never {
+func run(_ preferred: [String]) -> Never {
   // Device list changes too, so a preferred device takes over when plugged in.
   for selector in [kAudioHardwarePropertyDefaultInputDevice, kAudioHardwarePropertyDevices] {
     var a = address(selector)
     AudioObjectAddPropertyListenerBlock(system, &a, .main) { _, _ in enforce(preferred) }
   }
-  log("watching default input, target: \(preferred ?? "built-in mic")")
+  log("watching default input, priority: \(describe(preferred))")
   enforce(preferred)
   dispatchMain()
 }
@@ -110,22 +121,40 @@ func launchctl(_ args: String..., quiet: Bool = false) {
   p.waitUntilExit()
 }
 
-// Numbered list of input devices; empty answer or 0 keeps the built-in mic.
-func pick() -> String? {
+// Turns device numbers (as printed by `devices`) into names; anything else is
+// taken as a device name or `built-in`. nil if a number is out of range.
+func choices(_ items: [String]) -> [String]? {
   let names = inputDevices().map(name)
-  print("Which input should micguard keep as default?")
-  print("  0) built-in microphone (default)")
-  for (i, n) in names.enumerated() { print("  \(i + 1)) \(n)") }
-  while true {
-    print("> ", terminator: "")
-    guard let line = readLine()?.trimmingCharacters(in: .whitespaces) else { return nil }
-    if line.isEmpty || line == "0" { return nil }
-    if let i = Int(line), names.indices.contains(i - 1) { return names[i - 1] }
-    print("enter a number from 0 to \(names.count)")
+  var out: [String] = []
+  for item in items {
+    if let i = Int(item) {
+      guard names.indices.contains(i - 1) else {
+        print("no device \(item); numbers go from 1 to \(names.count)")
+        return nil
+      }
+      out.append(names[i - 1])
+    } else {
+      if item != builtInEntry && !names.contains(item) { print("note: \(item) is not connected now") }
+      out.append(item)
+    }
+  }
+  return out
+}
+
+func printDevices() {
+  let current = defaultInput()
+  let builtIn = builtInMic()
+  let preferred = installedPreferences()
+  for (i, id) in inputDevices().enumerated() {
+    var tags: [String] = []
+    if id == current { tags.append("default") }
+    if id == builtIn { tags.append("built-in") }
+    if let p = preferred.firstIndex(where: { resolve($0) == id }) { tags.append("priority \(p + 1)") }
+    print("  \(i + 1)) \(name(id))" + (tags.isEmpty ? "" : "  [\(tags.joined(separator: ", "))]"))
   }
 }
 
-func install(_ preferred: String?) throws {
+func install(_ preferred: [String]) throws {
   let fm = FileManager.default
   guard let me = Bundle.main.executableURL?.resolvingSymlinksInPath() else {
     throw CocoaError(.fileNoSuchFile)
@@ -137,7 +166,7 @@ func install(_ preferred: String?) throws {
   }
   let plist: [String: Any] = [
     "Label": label,
-    "ProgramArguments": [binPath.path, "run"] + (preferred.map { ["--prefer", $0] } ?? []),
+    "ProgramArguments": [binPath.path, "run"] + preferred.flatMap { ["--prefer", $0] },
     "RunAtLoad": true,
     "KeepAlive": true,
     "StandardErrorPath": logPath.path,
@@ -148,7 +177,7 @@ func install(_ preferred: String?) throws {
   launchctl("bootout", "\(domain)/\(label)", quiet: true)
   launchctl("bootstrap", domain, plistPath.path)
   print("installed \(binPath.path)\nagent \(plistPath.path)\nlog \(logPath.path)")
-  print("target \(preferred ?? "built-in mic")")
+  print("priority \(describe(preferred))")
 }
 
 func uninstall() {
@@ -158,41 +187,77 @@ func uninstall() {
   print("uninstalled")
 }
 
-// The installed agent's --prefer value, read back from its plist.
-func installedPreference() -> String? {
+// The installed agent's --prefer values, read back from its plist.
+func installedPreferences() -> [String] {
   guard let data = try? Data(contentsOf: plistPath),
         let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
-        let args = plist["ProgramArguments"] as? [String] else { return nil }
-  return preference(args)
+        let args = plist["ProgramArguments"] as? [String] else { return [] }
+  return preferences(args)
 }
 
+func isInstalled() -> Bool { FileManager.default.fileExists(atPath: plistPath.path) }
+
+func printList() {
+  let preferred = installedPreferences()
+  if preferred.isEmpty { print("  1) built-in mic (no list set)"); return }
+  let active = target(preferred)
+  for (i, entry) in preferred.enumerated() {
+    let id = resolve(entry)
+    let state = id == nil ? "not connected" : id == active ? "active" : "connected"
+    print("  \(i + 1)) \(entry)  [\(state)]")
+  }
+}
+
+
 func status() {
-  let installed = FileManager.default.fileExists(atPath: plistPath.path)
-  let preferred = installedPreference()
+  let installed = isInstalled()
+  let preferred = installedPreferences()
   print("built-in mic:  \(builtInMic().map(name) ?? "not found")")
   print("default input: \(defaultInput().map(name) ?? "none")")
   print("agent plist:   \(installed ? plistPath.path : "not installed")")
   if installed {
-    let present = target(preferred) != nil ? "connected" : "not connected"
-    print("target:        \(preferred ?? "built-in mic") (\(present))")
+    print("target:        \(target(preferred).map(name) ?? "none connected")")
+    print("priority:")
+    printList()
   }
 }
 
 // MARK: main
 
-func preference(_ args: [String]) -> String? {
-  args.firstIndex(of: "--prefer").flatMap { args.indices.contains($0 + 1) ? args[$0 + 1] : nil }
+// Every --prefer value, in order; the order is the priority.
+func preferences(_ args: [String]) -> [String] {
+  args.indices.compactMap { i in
+    args[i] == "--prefer" && args.indices.contains(i + 1) ? args[i + 1] : nil
+  }
 }
+
+func installOrExit(_ preferred: [String]) {
+  do { try install(preferred) } catch { log("install failed: \(error)"); exit(1) }
+}
+
+let usage = """
+  usage: micguard COMMAND
+    devices                   list input devices, numbered
+    prefer DEVICE...          set the priority list (numbers from `devices`,
+                              names, or `built-in`); installs or restarts the agent
+    status                    default input, agent state and priority list
+    install                   install or update the agent, keeping the list
+    uninstall                 remove the agent and binary
+    run [--prefer DEVICE]...  run in the foreground (what the agent runs)
+  """
 
 let args = Array(CommandLine.arguments.dropFirst())
 switch args.first ?? "run" {
-case "run": run(preference(args))
-case "install":
-  let preferred = args.contains("--prefer") ? preference(args) : (isatty(0) != 0 ? pick() : nil)
-  do { try install(preferred) } catch { log("install failed: \(error)"); exit(1) }
+case "run": run(preferences(args))
+case "install": installOrExit(installedPreferences())
+case "prefer":
+  let items = Array(args.dropFirst())
+  guard !items.isEmpty, let preferred = choices(items) else { print(usage); exit(2) }
+  installOrExit(preferred)
+case "devices": printDevices()
 case "uninstall": uninstall()
 case "status": status()
 default:
-  print("usage: micguard [run|install|uninstall|status] [--prefer DEVICE]")
+  print(usage)
   exit(2)
 }
