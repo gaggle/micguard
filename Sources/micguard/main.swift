@@ -154,19 +154,6 @@ func printDevices() {
   }
 }
 
-// Asks for device numbers in priority order; an empty answer keeps the built-in mic.
-func pick() -> [String] {
-  print("Input devices:")
-  printDevices()
-  print("Enter device numbers in priority order (e.g. 2 1), or press Enter for the built-in mic.")
-  while true {
-    print("> ", terminator: "")
-    guard let line = readLine() else { return [] }
-    let items = line.split(whereSeparator: { $0 == " " || $0 == "," }).map(String.init)
-    if let picked = choices(items) { return picked }
-  }
-}
-
 func install(_ preferred: [String]) throws {
   let fm = FileManager.default
   guard let me = Bundle.main.executableURL?.resolvingSymlinksInPath() else {
@@ -211,7 +198,6 @@ func installedPreferences() -> [String] {
 func isInstalled() -> Bool { FileManager.default.fileExists(atPath: plistPath.path) }
 
 func printList() {
-  guard isInstalled() else { print("not installed"); return }
   let preferred = installedPreferences()
   if preferred.isEmpty { print("  1) built-in mic (no list set)"); return }
   let active = target(preferred)
@@ -222,6 +208,7 @@ func printList() {
   }
 }
 
+
 func status() {
   let installed = isInstalled()
   let preferred = installedPreferences()
@@ -229,8 +216,9 @@ func status() {
   print("default input: \(defaultInput().map(name) ?? "none")")
   print("agent plist:   \(installed ? plistPath.path : "not installed")")
   if installed {
-    print("priority:      \(describe(preferred))")
     print("target:        \(target(preferred).map(name) ?? "none connected")")
+    print("priority:")
+    printList()
   }
 }
 
@@ -250,27 +238,23 @@ func installOrExit(_ preferred: [String]) {
 let usage = """
   usage: micguard COMMAND
     devices                   list input devices, numbered
-    list                      show the installed priority list
     prefer DEVICE...          set the priority list (numbers from `devices`,
-                              names, or `built-in`) and restart the agent
-    install [--prefer DEVICE]...
-    uninstall
-    status
-    run [--prefer DEVICE]...
+                              names, or `built-in`); installs or restarts the agent
+    status                    default input, agent state and priority list
+    install                   install or update the agent, keeping the list
+    uninstall                 remove the agent and binary
+    run [--prefer DEVICE]...  run in the foreground (what the agent runs)
   """
 
 let args = Array(CommandLine.arguments.dropFirst())
 switch args.first ?? "run" {
 case "run": run(preferences(args))
-case "install":
-  let preferred = args.contains("--prefer") ? preferences(args) : (isatty(0) != 0 ? pick() : [])
-  installOrExit(preferred)
+case "install": installOrExit(installedPreferences())
 case "prefer":
   let items = Array(args.dropFirst())
   guard !items.isEmpty, let preferred = choices(items) else { print(usage); exit(2) }
   installOrExit(preferred)
 case "devices": printDevices()
-case "list": printList()
 case "uninstall": uninstall()
 case "status": status()
 default:
